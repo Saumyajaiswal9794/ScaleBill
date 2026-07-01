@@ -9,6 +9,7 @@ export interface ITenant extends Document {
   apiLimit: number;
   storageLimit: number; // in GB
   bandwidthLimit: number; // in GB
+  billingAnchorDay: number;
   createdAt: Date;
 }
 
@@ -20,6 +21,7 @@ const TenantSchema: Schema = new Schema({
   apiLimit: { type: Number, required: true },
   storageLimit: { type: Number, required: true },
   bandwidthLimit: { type: Number, required: true },
+  billingAnchorDay: { type: Number, required: true, default: 1 },
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -30,6 +32,7 @@ export interface IUsageEvent extends Document {
   tenantId: string;
   metric: 'api_calls' | 'storage_gb' | 'bandwidth_gb';
   amount: number;
+  idempotencyKey?: string;
   timestamp: Date;
 }
 
@@ -37,10 +40,12 @@ const UsageEventSchema: Schema = new Schema({
   tenantId: { type: String, required: true, index: true },
   metric: { type: String, enum: ['api_calls', 'storage_gb', 'bandwidth_gb'], required: true },
   amount: { type: Number, required: true },
+  idempotencyKey: { type: String, required: false, sparse: true, index: true },
   timestamp: { type: Date, default: Date.now, index: true }
 });
 
 UsageEventSchema.index({ tenantId: 1, metric: 1, timestamp: -1 });
+UsageEventSchema.index({ idempotencyKey: 1 }, { unique: true, sparse: true });
 
 export interface IInvoice extends Document {
   tenantId: string;
@@ -88,6 +93,7 @@ export interface IAlert extends Document {
   thresholdType: '80%' | '95%';
   usageValue: number;
   limitValue: number;
+  periodKey: string;
   createdAt: Date;
 }
 
@@ -97,13 +103,32 @@ const AlertSchema: Schema = new Schema({
   thresholdType: { type: String, enum: ['80%', '95%'], required: true },
   usageValue: { type: Number, required: true },
   limitValue: { type: Number, required: true },
+  periodKey: { type: String, required: true },
   createdAt: { type: Date, default: Date.now }
 });
 
+AlertSchema.index({ tenantId: 1, metric: 1, thresholdType: 1, periodKey: 1 }, { unique: true });
 AlertSchema.index({ tenantId: 1, createdAt: -1 });
+
+export interface IInvoiceCounter extends Document {
+  tenantId: string;
+  periodKey: string;
+  sequence: number;
+  createdAt: Date;
+}
+
+const InvoiceCounterSchema: Schema = new Schema({
+  tenantId: { type: String, required: true },
+  periodKey: { type: String, required: true },
+  sequence: { type: Number, default: 0 },
+  createdAt: { type: Date, default: Date.now }
+});
+
+InvoiceCounterSchema.index({ tenantId: 1, periodKey: 1 }, { unique: true });
 
 export const Tenant = mongoose.model<ITenant>('Tenant', TenantSchema);
 export const UsageEvent = mongoose.model<IUsageEvent>('UsageEvent', UsageEventSchema);
 export const Invoice = mongoose.model<IInvoice>('Invoice', InvoiceSchema);
 export const Alert = mongoose.model<IAlert>('Alert', AlertSchema);
+export const InvoiceCounter = mongoose.model<IInvoiceCounter>('InvoiceCounter', InvoiceCounterSchema);
 

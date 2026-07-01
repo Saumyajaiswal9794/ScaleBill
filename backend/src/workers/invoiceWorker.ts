@@ -1,8 +1,9 @@
 import fs from 'fs';
 import path from 'path';
 import PDFDocument from 'pdfkit';
-import { Tenant, UsageEvent, Invoice, ITenant } from '../models';
+import { Tenant, UsageEvent, Invoice, InvoiceCounter, ITenant } from '../models';
 import { calculateBilling, PLAN_PRICING } from '../pricing';
+import { getBillingPeriod, getTenantBillingAnchorDay } from '../billingPeriod';
 
 const INVOICE_DIR = path.join(__dirname, '../../../invoices');
 
@@ -43,7 +44,16 @@ export async function processTenantInvoice(tenant: ITenant, start: Date, end: Da
   // Calculate fees
   const billingInfo = calculateBilling(tenant.planType, usageSummary);
 
-  const invoiceNumber = `INV-${tenant.tenantId.toUpperCase()}-${Date.now().toString().slice(-6)}`;
+  const billingAnchorDay = getTenantBillingAnchorDay(tenant);
+  const period = getBillingPeriod(start, billingAnchorDay);
+  const shortCode = tenant.tenantId.replace(/[^A-Za-z0-9]/g, '').toUpperCase() || 'TENANT';
+  const counter = await InvoiceCounter.findOneAndUpdate(
+    { tenantId: tenant.tenantId, periodKey: period.periodKey },
+    { $inc: { sequence: 1 }, $setOnInsert: { createdAt: new Date() } },
+    { new: true, upsert: true }
+  );
+  const sequence = counter?.sequence || 1;
+  const invoiceNumber = `${shortCode}-${period.periodKey.replace('-', '')}-${sequence}`;
   const pdfFilename = `${invoiceNumber}.pdf`;
   const pdfPath = path.join(INVOICE_DIR, pdfFilename);
 

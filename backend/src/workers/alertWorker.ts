@@ -1,13 +1,16 @@
-import { Tenant, Alert, ITenant } from '../models';
+import { Alert, ITenant } from '../models';
 import { redis } from '../db';
+import { getBillingPeriod, getRedisUsageKey, getTenantBillingAnchorDay } from '../billingPeriod';
 
-export async function checkTenantUsageAlerts(tenant: ITenant) {
+export async function checkTenantUsageAlerts(tenant: ITenant, referenceDate: Date = new Date()) {
   const metrics: Array<'api_calls' | 'storage_gb' | 'bandwidth_gb'> = [
     'api_calls',
     'storage_gb',
     'bandwidth_gb'
   ];
 
+  const billingAnchorDay = getTenantBillingAnchorDay(tenant);
+  const currentPeriod = getBillingPeriod(referenceDate, billingAnchorDay);
   const results: string[] = [];
 
   for (const metric of metrics) {
@@ -20,7 +23,7 @@ export async function checkTenantUsageAlerts(tenant: ITenant) {
     if (limit <= 0) continue;
 
     // Get current usage from Redis
-    const redisKey = `usage:${tenant.tenantId}:${metric}`;
+  const redisKey = getRedisUsageKey(tenant.tenantId, metric, currentPeriod.periodKey);
     const usageStr = await redis.get(redisKey);
     const usage = usageStr ? parseFloat(usageStr) : 0;
 
@@ -34,12 +37,12 @@ export async function checkTenantUsageAlerts(tenant: ITenant) {
     }
 
     if (threshold) {
-      // Check if we already alerted this threshold for this metric in the last 12 hours
+      // Check if we already alerted this threshold for this metric in the current billing period
       const recentAlert = await Alert.findOne({
         tenantId: tenant.tenantId,
         metric,
         thresholdType: threshold,
-        createdAt: { $gte: new Date(Date.now() - 12 * 60 * 60 * 1000) }
+        periodKey: currentPeriod.periodKey
       });
 
       if (!recentAlert) {
@@ -49,7 +52,8 @@ export async function checkTenantUsageAlerts(tenant: ITenant) {
           metric,
           thresholdType: threshold,
           usageValue: usage,
-          limitValue: limit
+          limitValue: limit,
+          periodKey: currentPeriod.periodKey
         });
         await alert.save();
 

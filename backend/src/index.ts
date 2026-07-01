@@ -2,11 +2,13 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
+import PDFDocument from 'pdfkit';
 import { connectDB, redis } from './db';
 import { Tenant, UsageEvent, Invoice, Alert } from './models';
 import { calculateBilling, PLAN_PRICING } from './pricing';
 import { processTenantInvoice } from './workers/invoiceWorker';
 import { checkTenantUsageAlerts } from './workers/alertWorker';
+import { getBillingPeriod, getRedisUsageKey, getTenantBillingAnchorDay } from './billingPeriod';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -48,15 +50,18 @@ app.post('/api/tenants', async (req, res) => {
       email,
       apiLimit: pricing.apiLimit,
       storageLimit: pricing.storageLimit,
-      bandwidthLimit: pricing.bandwidthLimit
+      bandwidthLimit: pricing.bandwidthLimit,
+      billingAnchorDay: new Date().getDate()
     });
 
     await tenant.save();
 
+    const period = getBillingPeriod(new Date(), getTenantBillingAnchorDay(tenant));
+
     // Reset Redis counters for new tenant
-    await redis.set(`usage:${tenantId}:api_calls`, '0');
-    await redis.set(`usage:${tenantId}:storage_gb`, '0');
-    await redis.set(`usage:${tenantId}:bandwidth_gb`, '0');
+    await redis.set(getRedisUsageKey(tenantId, 'api_calls', period.periodKey), '0');
+    await redis.set(getRedisUsageKey(tenantId, 'storage_gb', period.periodKey), '0');
+    await redis.set(getRedisUsageKey(tenantId, 'bandwidth_gb', period.periodKey), '0');
 
     res.status(201).json(tenant);
   } catch (error: any) {
@@ -67,7 +72,7 @@ app.post('/api/tenants', async (req, res) => {
 // 3. Ingest usage event
 app.post('/api/usage', async (req, res) => {
   try {
-    const { tenantId, metric, amount } = req.body;
+    const { tenantId, metric, amount, idempotencyKey } = req.body;
 
     if (!tenantId || !metric || amount === undefined) {
       return res.status(400).json({ error: 'Missing required parameters' });
@@ -78,15 +83,34 @@ app.post('/api/usage', async (req, res) => {
       return res.status(404).json({ error: 'Tenant not found' });
     }
 
+    const billingAnchorDay = getTenantBillingAnchorDay(tenant);
+    const currentPeriod = getBillingPeriod(new Date(), billingAnchorDay);
+
+    if (idempotencyKey) {
+      const existingEvent = await UsageEvent.findOne({ idempotencyKey });
+      if (existingEvent) {
+        const currentTotal = parseFloat((await redis.get(getRedisUsageKey(tenantId, metric, currentPeriod.periodKey))) || '0');
+        return res.json({
+          success: true,
+          deduplicated: true,
+          tenantId,
+          metric,
+          increment: 0,
+          currentTotal
+        });
+      }
+    }
+
     // Increments counter in Redis atomically
-    const redisKey = `usage:${tenantId}:${metric}`;
+    const redisKey = getRedisUsageKey(tenantId, metric, currentPeriod.periodKey);
     const newUsage = await redis.incrbyfloat(redisKey, amount);
 
     // Save event to MongoDB asynchronously
     const event = new UsageEvent({
       tenantId,
       metric,
-      amount
+      amount,
+      idempotencyKey
     });
     await event.save();
 
@@ -117,9 +141,10 @@ app.get('/api/dashboard/:tenantId', async (req, res) => {
     }
 
     // Get usage from Redis
-    const api_calls = parseFloat((await redis.get(`usage:${tenantId}:api_calls`)) || '0');
-    const storage_gb = parseFloat((await redis.get(`usage:${tenantId}:storage_gb`)) || '0');
-    const bandwidth_gb = parseFloat((await redis.get(`usage:${tenantId}:bandwidth_gb`)) || '0');
+    const currentPeriod = getBillingPeriod(new Date(), getTenantBillingAnchorDay(tenant));
+    const api_calls = parseFloat((await redis.get(getRedisUsageKey(tenantId, 'api_calls', currentPeriod.periodKey))) || '0');
+    const storage_gb = parseFloat((await redis.get(getRedisUsageKey(tenantId, 'storage_gb', currentPeriod.periodKey))) || '0');
+    const bandwidth_gb = parseFloat((await redis.get(getRedisUsageKey(tenantId, 'bandwidth_gb', currentPeriod.periodKey))) || '0');
 
     const usageSummary = { api_calls, storage_gb, bandwidth_gb };
 
@@ -161,17 +186,17 @@ app.get('/api/dashboard/:tenantId', async (req, res) => {
               v: '$total'
             }
           }
-        },
-        {
-          $project: {
-            day: '$_id',
-            data: { $arrayToObject: '$metrics' }
-          }
-        },
-        {
-          $sort: { day: 1 }
         }
-      ]
+      },
+      {
+        $project: {
+          day: '$_id',
+          data: { $arrayToObject: '$metrics' }
+        }
+      },
+      {
+        $sort: { day: 1 }
+      }
     ]);
 
     // Format historical charts data
@@ -204,11 +229,9 @@ app.post('/api/invoices/generate', async (req, res) => {
       return res.status(404).json({ error: 'Tenant not found' });
     }
 
-    const start = new Date();
-    start.setDate(1); // Start of current month
-    start.setHours(0, 0, 0, 0);
-
-    const end = new Date(); // Right now
+    const period = getBillingPeriod(new Date(), getTenantBillingAnchorDay(tenant));
+    const start = period.periodStart;
+    const end = period.periodEnd;
 
     const invoice = await processTenantInvoice(tenant, start, end);
     res.json({ success: true, invoice });
@@ -251,7 +274,8 @@ app.post('/api/seed', async (req, res) => {
         email: 'billing@acme.com',
         apiLimit: PLAN_PRICING.Starter.apiLimit,
         storageLimit: PLAN_PRICING.Starter.storageLimit,
-        bandwidthLimit: PLAN_PRICING.Starter.bandwidthLimit
+        bandwidthLimit: PLAN_PRICING.Starter.bandwidthLimit,
+        billingAnchorDay: 1
       },
       {
         tenantId: 'betalabs',
@@ -260,7 +284,8 @@ app.post('/api/seed', async (req, res) => {
         email: 'billing@betalabs.io',
         apiLimit: PLAN_PRICING.Pro.apiLimit,
         storageLimit: PLAN_PRICING.Pro.storageLimit,
-        bandwidthLimit: PLAN_PRICING.Pro.bandwidthLimit
+        bandwidthLimit: PLAN_PRICING.Pro.bandwidthLimit,
+        billingAnchorDay: 1
       },
       {
         tenantId: 'sigma',
@@ -269,7 +294,8 @@ app.post('/api/seed', async (req, res) => {
         email: 'billing@sigma.com',
         apiLimit: PLAN_PRICING.Enterprise.apiLimit,
         storageLimit: PLAN_PRICING.Enterprise.storageLimit,
-        bandwidthLimit: PLAN_PRICING.Enterprise.bandwidthLimit
+        bandwidthLimit: PLAN_PRICING.Enterprise.bandwidthLimit,
+        billingAnchorDay: 1
       }
     ];
 
@@ -277,6 +303,7 @@ app.post('/api/seed', async (req, res) => {
 
     // Seed mock data for each tenant
     for (const t of tenants) {
+      const period = getBillingPeriod(new Date(), getTenantBillingAnchorDay(t));
       // Set Redis current month values
       let apiUsage = 0;
       let storageUsage = 0;
@@ -299,9 +326,9 @@ app.post('/api/seed', async (req, res) => {
         bandwidthUsage = 1200;
       }
 
-      await redis.set(`usage:${t.tenantId}:api_calls`, apiUsage.toString());
-      await redis.set(`usage:${t.tenantId}:storage_gb`, storageUsage.toString());
-      await redis.set(`usage:${t.tenantId}:bandwidth_gb`, bandwidthUsage.toString());
+      await redis.set(getRedisUsageKey(t.tenantId, 'api_calls', period.periodKey), apiUsage.toString());
+      await redis.set(getRedisUsageKey(t.tenantId, 'storage_gb', period.periodKey), storageUsage.toString());
+      await redis.set(getRedisUsageKey(t.tenantId, 'bandwidth_gb', period.periodKey), bandwidthUsage.toString());
 
       // Write historical events for the last 14 days
       const batchEvents = [];
@@ -351,7 +378,7 @@ app.post('/api/seed', async (req, res) => {
         bandwidth_gb: parseFloat((bandwidthUsage * 0.9).toFixed(2))
       };
 
-      const pricingInfo = calculateBilling(t.planType, lastMonthSummary);
+      const pricingInfo = calculateBilling(t.planType as 'Starter' | 'Pro' | 'Enterprise', lastMonthSummary);
       const invoiceNumber = `INV-${t.tenantId.toUpperCase()}-${Math.floor(100000 + Math.random() * 900000)}`;
       const pdfFilename = `${invoiceNumber}.pdf`;
       const pdfPath = path.join(INVOICES_DIR, pdfFilename);
@@ -375,7 +402,7 @@ app.post('/api/seed', async (req, res) => {
       await oldInvoice.save();
 
       // Trigger threshold check
-      await checkTenantUsageAlerts(t);
+      await checkTenantUsageAlerts(t as any);
     }
 
     res.json({ success: true, message: 'Database successfully seeded with mock data' });
