@@ -10,6 +10,9 @@
     "start": "ts-node src/index.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1079.0",
+    "@aws-sdk/client-ses": "^3.1079.0",
+    "@aws-sdk/client-sns": "^3.1079.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",

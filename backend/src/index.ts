@@ -151,6 +151,45 @@ app.get('/api/dashboard/:tenantId', async (req, res) => {
     // Calculate billing
     const billing = calculateBilling(tenant.planType, usageSummary);
 
+    // Fetch monthly usage summary for the current billing period
+    const monthlyUsage = await UsageEvent.aggregate([
+      {
+        $match: {
+          tenantId,
+          timestamp: { $gte: currentPeriod.periodStart, $lte: currentPeriod.periodEnd }
+        }
+      },
+      {
+        $group: {
+          _id: '$metric',
+          eventCount: { $sum: 1 },
+          totalUsage: { $sum: '$amount' }
+        }
+      }
+    ]);
+
+    const monthlyBreakdown = ['api_calls', 'storage_gb', 'bandwidth_gb'].map((metric) => {
+      const item = monthlyUsage.find((entry) => entry._id === metric);
+      const totalUsage = item?.totalUsage || 0;
+      const eventCount = item?.eventCount || 0;
+
+      let charge = 0;
+      if (metric === 'api_calls') {
+        charge = Math.max(0, totalUsage - tenant.apiLimit) * PLAN_PRICING[tenant.planType].apiOverageRate;
+      } else if (metric === 'storage_gb') {
+        charge = Math.max(0, totalUsage - tenant.storageLimit) * PLAN_PRICING[tenant.planType].storageOverageRate;
+      } else if (metric === 'bandwidth_gb') {
+        charge = Math.max(0, totalUsage - tenant.bandwidthLimit) * PLAN_PRICING[tenant.planType].bandwidthOverageRate;
+      }
+
+      return {
+        metric,
+        eventCount,
+        totalUsage: parseFloat(totalUsage.toFixed(2)),
+        charge: parseFloat(charge.toFixed(2))
+      };
+    });
+
     // Fetch invoice history
     const invoices = await Invoice.find({ tenantId }).sort({ periodEnd: -1 }).limit(10);
 
@@ -211,6 +250,12 @@ app.get('/api/dashboard/:tenantId', async (req, res) => {
       tenant,
       usage: usageSummary,
       billing,
+      monthlyBreakdown,
+      currentPeriod: {
+        periodKey: currentPeriod.periodKey,
+        periodStart: currentPeriod.periodStart,
+        periodEnd: currentPeriod.periodEnd
+      },
       invoices,
       alerts,
       history: formattedHistory
