@@ -1,0 +1,96 @@
+================================================================================
+ScaleBill Project Status & Update Report
+================================================================================
+
+This document provides a comprehensive summary of the work completed so far and the tasks/gaps that remain outstanding in the ScaleBill multi-tenant SaaS billing platform.
+
+--------------------------------------------------------------------------------
+1. COMPLETED WORK
+--------------------------------------------------------------------------------
+
+A. Architecture & Monorepo Setup
+   - Formulated a logical local monorepo structure with:
+     * Next.js frontend dashboard (`frontend/`)
+     * TypeScript Express backend server (`backend/`)
+     * Shared configuration, docker-compose, and architecture documentation.
+   - Configured Docker Compose setup for local stateful dependencies (MongoDB and Redis).
+
+B. Data Model & Database Integration (MongoDB + Redis)
+   - Configured MongoDB models using Mongoose for:
+     * Tenants (tenant details, active plan resource limits, billing anchor day)
+     * UsageEvents (historical logs of consumed resource metrics)
+     * Invoices (billing statements, fees, status, pdf file paths, email tracking)
+     * Alerts (usage threshold alerts at 80% and 95% limits)
+   - Built a Redis-based live counting system:
+     * Utilizes period-suffixed keys (`usage:{tenantId}:{metric}:{periodKey}`) to isolate usage per billing period.
+     * Implements atomic real-time increments (`incrbyfloat`) when usage is ingested.
+
+C. Ingestion & Pricing Engine
+   - Implemented an in-memory pricing calculator with tier definitions for Starter, Pro, and Enterprise plans (handling base fees, resource limits, and overage rates for API Calls, Storage, and Bandwidth).
+   - Designed a `/api/usage` endpoint supporting:
+     * Idempotency check with client-supplied keys to prevent double-counting.
+     * Async saving to MongoDB and firing background alert checks.
+
+D. Worker Logic
+   - Invoice Worker (`invoiceWorker.ts`):
+     * Aggregates usage events directly from MongoDB for accurate periodic billing.
+     * Computes base fees and overage costs.
+     * Generates invoice PDFs locally using PDFKit.
+     * Persists Invoice documents with sequential, unique, human-readable numbers.
+   - Alert Worker (`alertWorker.ts`):
+     * Compares live Redis counters against tenant plan limits.
+     * Triggers alerts at 80% and 95% thresholds.
+     * Deduplicates alerts (max one alert per tenant, metric, threshold type, and period).
+
+E. REST API Endpoints
+   - `GET /api/tenants` - Fetches all registered tenants.
+   - `POST /api/tenants` - Creates a tenant and initializes Redis counters.
+   - `POST /api/usage` - Ingests usage metrics.
+   - `GET /api/dashboard/:tenantId` - Aggregates live usage, billing costs, invoices, alerts, and 14-day history.
+   - `POST /api/invoices/generate` - Triggers manual invoice generation.
+   - `POST /api/alerts/check` - Triggers manual alert threshold check.
+   - `POST /api/seed` - Resets the database and seeds Acme, BetaLabs, and Sigma Enterprise demo data.
+
+F. Next.js Frontend Dashboard
+   - Crafted a premium, fully-responsive dashboard UI using modern typography, glassmorphism, and ambient gradients.
+   - Implemented live tenant switching.
+   - Embedded a usage intake simulator to test ingestion easily.
+   - Designed real-time utilization progress bars with status badges (Normal / Warning / Danger).
+   - Embedded Recharts trend areas showing 14-day usage history.
+    - Displayed recent alerts feed and invoice ledger with direct links to download generated invoice PDFs.
+    - Added a "Monthly Report" tab with breakdown calculations by resource.
+
+G. Authentication & Security
+   - Implemented secure user registration and login endpoints using bcrypt for password hashing and JWT for access tokens.
+   - Configured JWT authentication (access tokens with 15m expiration, refresh tokens with 7d expiration stored in MongoDB).
+   - Secured backend routes with middleware enforcing authorization (`requireAuth`), role-based access (`requireRole`), and tenant-isolation (`requireTenantAccess`).
+   - Integrated API key authentication (`requireApiKey` checking `x-api-key` header) specifically for ingestion client requests.
+   - Created frontend context (`authContext.tsx`) and a login page (`/login`) to support secure dashboard access.
+
+H. Input Validation & Rate Limiting
+   - Added schema validation using Zod for all core endpoints (tenant creation, usage ingestion, login, and registration).
+   - Set up Redis-backed rate limiting via `rate-limiter-flexible` including:
+     * Plan-specific usage ingestion limiters (Starter: 100 req/min, Pro: 500 req/min, Enterprise: 2000 req/min).
+     * Bruteforce login protection (5 attempts per 15 mins per IP).
+     * General API rate limiting (100 req/min per user/IP).
+
+--------------------------------------------------------------------------------
+2. REMAINING WORK / KNOWN GAPS
+--------------------------------------------------------------------------------
+
+A. Persistent Object Storage (S3/Cloud Storage Integration)
+   - Generated PDFs are stored only on the local server filesystem. If the container or server process restarts, all generated invoices are lost.
+   - Real integration with AWS S3 or equivalent Object Storage needs to replace the current simulation.
+
+B. Real Delivery Services
+   - Email Delivery: The SES email sending for invoices is simulated via console logs. A real SES/SendGrid SMTP integration is needed.
+   - Notification Alerts: Alert notifications to clients are simulated. Integration with AWS SNS or a notification delivery channel (Slack, email, SMS) is needed.
+
+C. Background Job Queue Setup
+   - Currently, alerts check and invoice PDF generation run synchronously in-process.
+   - For scale, these should be offloaded to queue-backed background workers (e.g., BullMQ, AWS SQS + Lambda) to prevent request blockages and handle failures/retries gracefully.
+
+D. Production Infrastructure & Observability
+   - Setup CI/CD pipelines.
+   - Implement Infrastructure as Code (IaC) for AWS resources (S3, SES, SNS).
+   - Add logging and metrics observability (e.g., Winston/Pino logger, Prometheus/Grafana or Datadog) to track API latency, queue lag, and invoice generation status.

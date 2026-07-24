@@ -1,33 +1,43 @@
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
-import { 
-  Database, 
-  Activity, 
-  HardDrive, 
-  Network, 
-  DollarSign, 
-  AlertTriangle, 
-  FileText, 
-  RefreshCw, 
-  PlusCircle, 
-  Sliders, 
-  User, 
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useAuth } from '../context/authContext';
+import { useRouter } from 'next/navigation';
+import {
+  Activity,
+  AlertTriangle,
+  ArrowUpRight,
+  Bell,
   CheckCircle,
-  Bell
+  Clock3,
+  Database,
+  DollarSign,
+  FileText,
+  HardDrive,
+  Network,
+  PlusCircle,
+  RefreshCw,
+  Shield,
+  Sparkles,
+  Sliders,
+  TrendingUp,
+  User,
+  LogOut,
 } from 'lucide-react';
 import {
-  AreaChart,
   Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Legend,
+  ResponsiveContainer,
+  Tooltip,
   XAxis,
   YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  BarChart,
-  Bar,
-  Legend
 } from 'recharts';
+
+type MetricName = 'api_calls' | 'storage_gb' | 'bandwidth_gb';
 
 interface Tenant {
   tenantId: string;
@@ -37,6 +47,7 @@ interface Tenant {
   apiLimit: number;
   storageLimit: number;
   bandwidthLimit: number;
+  billingAnchorDay?: number;
 }
 
 interface Billing {
@@ -67,9 +78,9 @@ interface Invoice {
   emailSent: boolean;
 }
 
-interface Alert {
+interface AlertItem {
   _id: string;
-  metric: string;
+  metric: MetricName;
   thresholdType: string;
   usageValue: number;
   limitValue: number;
@@ -83,560 +94,912 @@ interface HistoryItem {
   bandwidth_gb: number;
 }
 
-const API_BASE = 'http://localhost:4000/api';
+interface DashboardData {
+  tenant: Tenant;
+  usage: Record<MetricName, number>;
+  billing: Billing;
+  monthlyBreakdown: Array<{
+    metric: MetricName;
+    eventCount: number;
+    totalUsage: number;
+    charge: number;
+  }>;
+  currentPeriod: {
+    periodKey: string;
+    periodStart: string;
+    periodEnd: string;
+  };
+  invoices: Invoice[];
+  alerts: AlertItem[];
+  history: HistoryItem[];
+}
 
-export default function Home() {
+interface UtilizationCard {
+  key: MetricName;
+  label: string;
+  value: string;
+  limit: string;
+  percent: number;
+}
+
+type DashboardMode = 'overview' | 'monthly';
+
+const API_BASE = 'http://localhost:4000/api';
+const BACKEND_URL = 'http://localhost:4000';
+
+const metricCopy: Record<MetricName, { label: string; shortLabel: string; icon: React.ReactNode }> = {
+  api_calls: { label: 'API calls', shortLabel: 'Requests', icon: <Activity size={18} /> },
+  storage_gb: { label: 'Storage', shortLabel: 'GB stored', icon: <HardDrive size={18} /> },
+  bandwidth_gb: { label: 'Bandwidth', shortLabel: 'GB transferred', icon: <Network size={18} /> },
+};
+
+const metricOptions: Array<{ value: MetricName; label: string }> = [
+  { value: 'api_calls', label: 'API Calls' },
+  { value: 'storage_gb', label: 'Storage (GB)' },
+  { value: 'bandwidth_gb', label: 'Bandwidth (GB)' },
+];
+
+const currency = new Intl.NumberFormat('en-IN', {
+  style: 'currency',
+  currency: 'INR',
+  maximumFractionDigits: 0,
+});
+
+function formatCurrency(value: number) {
+  return currency.format(value);
+}
+
+function formatDate(value: string) {
+  return new Date(value).toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+}
+
+function formatDateTime(value: string) {
+  return new Date(value).toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
+function getUsagePercentage(current: number, limit: number) {
+  if (limit <= 0) return 0;
+  return Math.min(100, Math.round((current / limit) * 100));
+}
+
+function getBand(percent: number) {
+  if (percent >= 95) return 'danger';
+  if (percent >= 80) return 'warning';
+  return 'normal';
+}export default function Home() {
+  const { user, loading: authLoading, logout, getAuthHeaders } = useAuth();
+  const router = useRouter();
+
   const [tenants, setTenants] = useState<Tenant[]>([]);
   const [selectedTenantId, setSelectedTenantId] = useState<string>('');
-  const [dashboardData, setDashboardData] = useState<{
-    tenant: Tenant;
-    usage: { api_calls: number; storage_gb: number; bandwidth_gb: number };
-    billing: Billing;
-    invoices: Invoice[];
-    alerts: Alert[];
-    history: HistoryItem[];
-  } | null>(null);
-
-  // Form states
-  const [ingestMetric, setIngestMetric] = useState<'api_calls' | 'storage_gb' | 'bandwidth_gb'>('api_calls');
-  const [ingestAmount, setIngestAmount] = useState<string>('500');
+  const [dashboardData, setDashboardData] = useState<DashboardData | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [alertMessage, setAlertMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null);
+  const [apiOnline, setApiOnline] = useState(true);
+  const [dashboardMode, setDashboardMode] = useState<DashboardMode>('overview');
+  const [ingestMetric, setIngestMetric] = useState<MetricName>('api_calls');
+  const [ingestAmount, setIngestAmount] = useState('500');
+  const [alertMessage, setAlertMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
-  // Fetch all tenants
-  const fetchTenants = async () => {
+  const activeTenant = useMemo(
+    () => tenants.find((tenant) => tenant.tenantId === selectedTenantId) ?? null,
+    [tenants, selectedTenantId],
+  );
+
+  const fetchTenants = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/tenants`);
-      const data = await res.json();
-      setTenants(data);
-      if (data.length > 0 && !selectedTenantId) {
-        setSelectedTenantId(data[0].tenantId);
+      const res = await fetch(`${API_BASE}/tenants`, {
+        headers: { ...getAuthHeaders() }
+      });
+      if (!res.ok) {
+        throw new Error('Failed to load tenants');
       }
-    } catch (error) {
-      console.error('Error fetching tenants:', error);
-    }
-  };
 
-  // Fetch dashboard data for active tenant
+      const data = (await res.json()) as Tenant[];
+      setTenants(data);
+      setApiOnline(true);
+
+      setSelectedTenantId((currentTenantId) => {
+        if (currentTenantId && data.some((tenant) => tenant.tenantId === currentTenantId)) {
+          return currentTenantId;
+        }
+        return data[0]?.tenantId ?? '';
+      });
+
+      return data;
+    } catch {
+      setApiOnline(false);
+      setTenants([]);
+      setSelectedTenantId('');
+      return [] as Tenant[];
+    }
+  }, [getAuthHeaders]);
+
   const fetchDashboardData = useCallback(async (tenantId: string) => {
     if (!tenantId) return;
+
     try {
-      const res = await fetch(`${API_BASE}/dashboard/${tenantId}`);
-      if (res.ok) {
-        const data = await res.json();
-        setDashboardData(data);
+      const res = await fetch(`${API_BASE}/dashboard/${tenantId}`, {
+        headers: { ...getAuthHeaders() }
+      });
+      if (!res.ok) {
+        throw new Error('Failed to load dashboard data');
       }
-    } catch (error) {
-      console.error('Error fetching dashboard data:', error);
+
+      const data = (await res.json()) as DashboardData;
+      setDashboardData(data);
+      setApiOnline(true);
+    } catch {
+      setApiOnline(false);
+      throw new Error('backend-unavailable');
     }
-  }, []);
+  }, [getAuthHeaders]);
+  const refreshDashboard = useCallback(
+    async (tenantId: string) => {
+      if (!tenantId) return;
+
+      setIsRefreshing(true);
+      try {
+        await fetchDashboardData(tenantId);
+      } catch (error) {
+        if (error instanceof Error && error.message === 'backend-unavailable') {
+          setAlertMessage({ type: 'error', text: 'Backend is offline. Start the API and retry.' });
+        } else {
+          setAlertMessage({ type: 'error', text: 'Unable to refresh the dashboard right now.' });
+        }
+      } finally {
+        setIsRefreshing(false);
+      }
+    },
+    [fetchDashboardData],
+  );
 
   useEffect(() => {
-    fetchTenants();
-  }, []);
+    let isMounted = true;
+
+    async function loadInitialData() {
+      try {
+        setIsLoading(true);
+        const data = await fetchTenants();
+
+        const initialTenantId = selectedTenantId || data[0]?.tenantId || '';
+        if (initialTenantId && isMounted) {
+          await fetchDashboardData(initialTenantId);
+        }
+      } catch (error) {
+        if (isMounted) {
+          setAlertMessage({ type: 'error', text: 'Could not connect to the ScaleBill backend.' });
+        }
+      } finally {
+        if (isMounted) {
+          setIsLoading(false);
+        }
+      }
+    }
+
+    void loadInitialData();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [fetchDashboardData, fetchTenants, selectedTenantId]);
 
   useEffect(() => {
-    if (selectedTenantId) {
-      fetchDashboardData(selectedTenantId);
+    if (!selectedTenantId || isLoading) {
+      return;
     }
-  }, [selectedTenantId, fetchDashboardData]);
 
-  // Handle Event Ingestion
-  const handleIngest = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!selectedTenantId || !ingestAmount) return;
+    void refreshDashboard(selectedTenantId);
+  }, [isLoading, refreshDashboard, selectedTenantId]);
+
+  const handleIngest = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    if (!selectedTenantId || !ingestAmount) {
+      return;
+    }
 
     setIsSubmitting(true);
     setAlertMessage(null);
 
     try {
-      const res = await fetch(`${API_BASE}/usage`, {
+      const response = await fetch(`${API_BASE}/usage`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
         body: JSON.stringify({
           tenantId: selectedTenantId,
           metric: ingestMetric,
-          amount: parseFloat(ingestAmount)
-        })
+          amount: Number.parseFloat(ingestAmount),
+        }),
       });
 
-      if (res.ok) {
-        setAlertMessage({ type: 'success', text: `Successfully ingested ${ingestAmount} to ${ingestMetric}!` });
-        fetchDashboardData(selectedTenantId);
-      } else {
-        const err = await res.json();
-        setAlertMessage({ type: 'error', text: err.error || 'Ingestion failed' });
+      if (!response.ok) {
+        const errorBody = (await response.json()) as { error?: string };
+        throw new Error(errorBody.error || 'Usage ingestion failed');
       }
+
+      setAlertMessage({
+        type: 'success',
+        text: `Recorded ${ingestAmount} ${metricCopy[ingestMetric].shortLabel.toLowerCase()} for ${activeTenant?.name ?? 'the tenant'}.`,
+      });
+      await refreshDashboard(selectedTenantId);
     } catch (error) {
-      setAlertMessage({ type: 'error', text: 'Server connection failed' });
+      setAlertMessage({
+        type: 'error',
+        text: error instanceof Error ? error.message : 'Server connection failed',
+      });
     } finally {
       setIsSubmitting(false);
-      setTimeout(() => setAlertMessage(null), 4000);
+      window.setTimeout(() => setAlertMessage(null), 4000);
     }
   };
 
-  // Trigger manual invoice generation
   const handleGenerateInvoice = async () => {
     if (!selectedTenantId) return;
+
     try {
-      const res = await fetch(`${API_BASE}/invoices/generate`, {
+      const response = await fetch(`${API_BASE}/invoices/generate`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tenantId: selectedTenantId })
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ tenantId: selectedTenantId }),
       });
-      if (res.ok) {
-        setAlertMessage({ type: 'success', text: 'Invoice generated successfully!' });
-        fetchDashboardData(selectedTenantId);
+
+      if (!response.ok) {
+        const errorBody = (await response.json()) as { error?: string };
+        throw new Error(errorBody.error || 'Invoice generation failed');
       }
+
+      setAlertMessage({ type: 'success', text: 'Invoice generated for the current billing period.' });
+      await refreshDashboard(selectedTenantId);
     } catch (error) {
-      setAlertMessage({ type: 'error', text: 'Failed to generate invoice' });
+      setAlertMessage({
+        type: 'error',
+        text: error instanceof Error ? error.message : 'Failed to generate invoice',
+      });
     }
   };
 
-  // Trigger manual alert check
   const handleRunAlertCheck = async () => {
     if (!selectedTenantId) return;
+
     try {
-      const res = await fetch(`${API_BASE}/alerts/check`, {
+      const response = await fetch(`${API_BASE}/alerts/check`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tenantId: selectedTenantId })
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        body: JSON.stringify({ tenantId: selectedTenantId }),
       });
-      if (res.ok) {
-        const result = await res.json();
-        if (result.alertsTriggered && result.alertsTriggered.length > 0) {
-          setAlertMessage({ type: 'success', text: `Triggered ${result.alertsTriggered.length} new alert(s)!` });
-        } else {
-          setAlertMessage({ type: 'success', text: 'No new alert thresholds crossed.' });
-        }
-        fetchDashboardData(selectedTenantId);
+
+      if (!response.ok) {
+        const errorBody = (await response.json()) as { error?: string };
+        throw new Error(errorBody.error || 'Alert check failed');
       }
+
+      const result = (await response.json()) as { alertsTriggered?: unknown[] };
+      const count = result.alertsTriggered?.length ?? 0;
+      setAlertMessage({
+        type: 'success',
+        text: count > 0 ? `Triggered ${count} threshold alert${count > 1 ? 's' : ''}.` : 'No new threshold alerts were triggered.',
+      });
+      await refreshDashboard(selectedTenantId);
     } catch (error) {
-      setAlertMessage({ type: 'error', text: 'Failed to run alert checks' });
+      setAlertMessage({
+        type: 'error',
+        text: error instanceof Error ? error.message : 'Failed to run alert checks',
+      });
     }
   };
 
-  // Reset database with seeds
   const handleResetSeed = async () => {
-    if (!confirm('Are you sure you want to reset and seed the database? This deletes all current events.')) return;
+    if (!window.confirm('Reset and seed the database? This clears current events and rebuilds demo data.')) {
+      return;
+    }
+
     try {
-      const res = await fetch(`${API_BASE}/seed`, { method: 'POST' });
-      if (res.ok) {
-        setAlertMessage({ type: 'success', text: 'Database reset & seeded successfully!' });
-        await fetchTenants();
-        if (selectedTenantId) {
-          fetchDashboardData(selectedTenantId);
-        }
+      const response = await fetch(`${API_BASE}/seed`, {
+        method: 'POST',
+        headers: { ...getAuthHeaders() }
+      });
+
+      if (!response.ok) {
+        const errorBody = (await response.json()) as { error?: string };
+        throw new Error(errorBody.error || 'Seeding failed');
+      }
+
+      setAlertMessage({ type: 'success', text: 'Database seeded successfully.' });
+      const data = await fetchTenants();
+      const tenantId = data[0]?.tenantId || selectedTenantId;
+      if (tenantId) {
+        await fetchDashboardData(tenantId);
       }
     } catch (error) {
-      setAlertMessage({ type: 'error', text: 'Failed to seed database' });
+      setAlertMessage({
+        type: 'error',
+        text: error instanceof Error ? error.message : 'Failed to seed database',
+      });
     }
   };
 
-  if (!dashboardData) {
+  useEffect(() => {
+    if (!authLoading && !user) {
+      router.push('/login');
+    }
+  }, [user, authLoading, router]);
+
+  if (authLoading) {
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', width: '100%', alignItems: 'center', justifyContent: 'center', gap: '1rem', background: '#0B0F19' }}>
-        <RefreshCw style={{ animation: 'spin 1.5s linear infinite', color: '#6366F1' }} size={40} />
-        <p style={{ color: '#9CA3AF' }}>Connecting to ScaleBill backend server...</p>
-        <button onClick={handleResetSeed} className="btn btn-primary" style={{ marginTop: '1rem' }}>
-          Seed Database Initially
-        </button>
-      </div>
+      <main className="shell shell-loading">
+        <div className="loading-panel glass-card">
+          <div className="loading-orb" />
+          <div className="loading-copy">
+            <div className="eyebrow">
+              <Sparkles size={14} />
+              ScaleBill operator console
+            </div>
+            <h1>Checking session...</h1>
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  if (!user) return null;
+
+  if (isLoading || !dashboardData) {
+    return (
+      <main className="shell shell-loading">
+        <div className="loading-panel glass-card">
+          <div className="loading-orb" />
+          <div className="loading-copy">
+            <div className="eyebrow">
+              <Sparkles size={14} />
+              ScaleBill operator console
+            </div>
+            <h1>{apiOnline ? 'Syncing tenant state' : 'Backend offline'}</h1>
+            <p>
+              {apiOnline
+                ? 'Connecting to the backend, loading live counters, and pulling the latest invoices.'
+                : 'The dashboard could not reach the API at localhost:4000. Start the backend and refresh this page.'}
+            </p>
+          </div>
+          <div className="control-row">
+            <button onClick={() => void refreshDashboard(selectedTenantId)} className="btn btn-primary" type="button" disabled={!selectedTenantId || !apiOnline}>
+              <RefreshCw size={16} /> Retry
+            </button>
+            <button onClick={handleResetSeed} className="btn btn-secondary" type="button" disabled={!apiOnline}>
+              <Sparkles size={16} /> Seed demo data
+            </button>
+          </div>
+        </div>
+      </main>
     );
   }
 
   const { tenant, usage, billing, invoices, alerts, history } = dashboardData;
 
-  // Percentage limit helper
-  const getUsagePercentage = (current: number, limit: number) => {
-    if (limit <= 0) return 0;
-    return Math.min(100, Math.round((current / limit) * 100));
-  };
-
   const apiPercent = getUsagePercentage(usage.api_calls, tenant.apiLimit);
   const storagePercent = getUsagePercentage(usage.storage_gb, tenant.storageLimit);
-  const bandwidthPercent = getUsagePercentage(usage.bandwidthLimit ? usage.bandwidth_gb : 0, tenant.bandwidthLimit);
+  const bandwidthPercent = getUsagePercentage(usage.bandwidth_gb, tenant.bandwidthLimit);
 
-  const getBadgeClass = (percent: number) => {
-    if (percent >= 95) return 'percentage-badge-danger';
-    if (percent >= 80) return 'percentage-badge-warning';
-    return 'percentage-badge-normal';
-  };
+  const utilizationCards: UtilizationCard[] = [
+    {
+      key: 'api_calls',
+      label: 'API calls',
+      value: usage.api_calls.toLocaleString(),
+      limit: tenant.apiLimit.toLocaleString(),
+      percent: apiPercent,
+    },
+    {
+      key: 'storage_gb',
+      label: 'Storage',
+      value: `${usage.storage_gb.toFixed(2)} GB`,
+      limit: `${tenant.storageLimit} GB`,
+      percent: storagePercent,
+    },
+    {
+      key: 'bandwidth_gb',
+      label: 'Bandwidth',
+      value: `${usage.bandwidth_gb.toFixed(2)} GB`,
+      limit: `${tenant.bandwidthLimit} GB`,
+      percent: bandwidthPercent,
+    },
+  ];
 
-  const getProgressBarClass = (percent: number) => {
-    if (percent >= 95) return 'bg-danger';
-    if (percent >= 80) return 'bg-warning';
-    return 'bg-primary';
-  };
-
+  const alertCount = alerts.length;
+  const monthlyTotalCharge = dashboardData.monthlyBreakdown.reduce((sum, item) => sum + item.charge, 0);
+  const monthlyTotalEvents = dashboardData.monthlyBreakdown.reduce((sum, item) => sum + item.eventCount, 0);
   return (
-    <div className="dashboard-container">
-      {/* Toast Alert */}
+    <main className="shell">
+      <div className="ambient ambient-left" />
+      <div className="ambient ambient-right" />
+
       {alertMessage && (
-        <div style={{
-          position: 'fixed',
-          top: '20px',
-          right: '20px',
-          zIndex: 1000,
-          background: alertMessage.type === 'success' ? '#10B981' : '#EF4444',
-          color: '#FFF',
-          padding: '0.75rem 1.5rem',
-          borderRadius: '10px',
-          boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.4)',
-          fontWeight: 600,
-          display: 'flex',
-          alignItems: 'center',
-          gap: '0.5rem',
-          animation: 'fadeIn 0.2s ease-out'
-        }}>
+        <div className={`toast toast-${alertMessage.type}`} role="status" aria-live="polite">
           {alertMessage.type === 'success' ? <CheckCircle size={18} /> : <AlertTriangle size={18} />}
-          {alertMessage.text}
+          <span>{alertMessage.text}</span>
         </div>
       )}
 
-      {/* Header */}
-      <header className="dashboard-header">
-        <div className="logo-container">
-          <div className="logo-icon">
-            <Database size={24} color="#FFF" />
-          </div>
+      <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', padding: '10px 20px', borderRadius: '16px', backgroundColor: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <User size={18} style={{ color: 'var(--primary)' }} />
           <div>
-            <h1 className="logo-text">ScaleBill</h1>
-            <div className="sub-info-row">
-              <span className="sub-info-item"><User size={12} /> Multi-Tenant SaaS Billing</span>
-            </div>
+            <span style={{ fontWeight: 600 }}>{user?.email}</span>
+            <span style={{ fontSize: '0.78rem', marginLeft: '10px', padding: '2px 8px', borderRadius: '999px', backgroundColor: 'rgba(124, 140, 255, 0.15)', color: 'var(--primary)', textTransform: 'lowercase' }}>{user?.role}</span>
           </div>
         </div>
-
-        <div className="tenant-selector-wrapper">
-          <label style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', fontWeight: 600 }}>WORKSPACE TENANT:</label>
-          <select 
-            value={selectedTenantId}
-            onChange={(e) => setSelectedTenantId(e.target.value)}
-            className="select-input"
-          >
-            {tenants.map((t) => (
-              <option key={t.tenantId} value={t.tenantId}>
-                {t.name} ({t.planType})
-              </option>
-            ))}
-          </select>
-          <button onClick={handleResetSeed} className="btn btn-secondary" title="Reset and seed default database">
-            <RefreshCw size={16} />
-          </button>
-        </div>
+        <button onClick={logout} className="btn btn-secondary" style={{ padding: '8px 14px', borderRadius: '10px', gap: '6px', fontSize: '0.88rem' }}>
+          <LogOut size={14} /> Logout
+        </button>
       </header>
 
-      {/* Main Grid: Usage metrics widgets */}
-      <div className="metrics-grid">
-        {/* Metric 1: API Calls */}
-        <div className="glass-card">
-          <div className="metric-header">
-            <div className="metric-title-group">
-              <div className="metric-icon-box api-calls-theme">
-                <Activity size={20} />
-              </div>
-              <span className="metric-name">API INGESTION CALLS</span>
-            </div>
-            <span className={`usage-percentage ${getBadgeClass(apiPercent)}`}>
-              {apiPercent}%
-            </span>
+      <section className="hero glass-card">
+        <div className="hero-copy">
+          <div className="eyebrow">
+            <Database size={14} />
+            ScaleBill dashboard
           </div>
-          <div className="metric-value-box">
-            <div className="metric-number">{usage.api_calls.toLocaleString()}</div>
-            <span className="metric-limit-label">Limit: {tenant.apiLimit.toLocaleString()} included</span>
-          </div>
-          <div className="progress-container">
-            <div className={`progress-bar ${getProgressBarClass(apiPercent)}`} style={{ width: `${apiPercent}%` }}></div>
-          </div>
-        </div>
-
-        {/* Metric 2: Storage */}
-        <div className="glass-card">
-          <div className="metric-header">
-            <div className="metric-title-group">
-              <div className="metric-icon-box storage-theme">
-                <HardDrive size={20} />
-              </div>
-              <span className="metric-name">STORAGE VOLUME</span>
-            </div>
-            <span className={`usage-percentage ${getBadgeClass(storagePercent)}`}>
-              {storagePercent}%
-            </span>
-          </div>
-          <div className="metric-value-box">
-            <div className="metric-number">{usage.storage_gb.toFixed(2)} GB</div>
-            <span className="metric-limit-label">Limit: {tenant.storageLimit} GB included</span>
-          </div>
-          <div className="progress-container">
-            <div className={`progress-bar ${getProgressBarClass(storagePercent)}`} style={{ width: `${storagePercent}%` }}></div>
-          </div>
-        </div>
-
-        {/* Metric 3: Bandwidth */}
-        <div className="glass-card">
-          <div className="metric-header">
-            <div className="metric-title-group">
-              <div className="metric-icon-box bandwidth-theme">
-                <Network size={20} />
-              </div>
-              <span className="metric-name">DATA TRANSFER (BANDWIDTH)</span>
-            </div>
-            <span className={`usage-percentage ${getBadgeClass(bandwidthPercent)}`}>
-              {bandwidthPercent}%
-            </span>
-          </div>
-          <div className="metric-value-box">
-            <div className="metric-number">{usage.bandwidth_gb.toFixed(2)} GB</div>
-            <span className="metric-limit-label">Limit: {tenant.bandwidthLimit} GB included</span>
-          </div>
-          <div className="progress-container">
-            <div className={`progress-bar ${getProgressBarClass(bandwidthPercent)}`} style={{ width: `${bandwidthPercent}%` }}></div>
-          </div>
-        </div>
-      </div>
-
-      {/* Main dashboard layout (Charts & Pricing Engine summary) */}
-      <div className="dashboard-layout">
-        {/* Left Side: Historical Trends */}
-        <div className="glass-card">
-          <div className="section-title">
-            <Activity size={20} color="#6366F1" />
-            <span>Usage History (Last 14 Days)</span>
-          </div>
-          
-          {history.length === 0 ? (
-            <div className="empty-state">No historical usage logged yet. Ingest usage to build charts.</div>
-          ) : (
-            <div className="chart-container">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={history} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="colorApi" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#6366F1" stopOpacity={0.4}/>
-                      <stop offset="95%" stopColor="#6366F1" stopOpacity={0.0}/>
-                    </linearGradient>
-                    <linearGradient id="colorStorage" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#10B981" stopOpacity={0.4}/>
-                      <stop offset="95%" stopColor="#10B981" stopOpacity={0.0}/>
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
-                  <XAxis dataKey="name" stroke="#6B7280" style={{ fontSize: '0.8rem' }} />
-                  <YAxis stroke="#6B7280" style={{ fontSize: '0.8rem' }} />
-                  <Tooltip 
-                    contentStyle={{ backgroundColor: '#111827', borderColor: 'rgba(255,255,255,0.1)', color: '#FFF' }}
-                    itemStyle={{ fontSize: '0.85rem' }}
-                  />
-                  <Legend wrapperStyle={{ fontSize: '0.85rem', paddingTop: '10px' }} />
-                  <Area type="monotone" name="API Calls" dataKey="api_calls" stroke="#6366F1" fillOpacity={1} fill="url(#colorApi)" />
-                  <Area type="monotone" name="Storage (GB)" dataKey="storage_gb" stroke="#10B981" fillOpacity={1} fill="url(#colorStorage)" />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
-          )}
-        </div>
-
-        {/* Right Side: Billing breakdown (Tiered Pricing Engine) */}
-        <div className="glass-card" style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
-          <div>
-            <div className="section-title">
-              <DollarSign size={20} color="#10B981" />
-              <span>Real-Time Pricing Engine</span>
-            </div>
-            
-            <div className="billing-summary-content" style={{ marginTop: '1rem' }}>
-              <div className="billing-cost-row">
-                <span className="cost-label">Subscription ({tenant.planType})</span>
-                <span className="cost-value">₹{billing.baseFee.toLocaleString()}</span>
-              </div>
-              <div className="billing-cost-row">
-                <span className="cost-label">API Overage Cost</span>
-                <span className="cost-value">₹{billing.apiOverage.toLocaleString()}</span>
-              </div>
-              <div className="billing-cost-row">
-                <span className="cost-label">Storage Overage Cost</span>
-                <span className="cost-value">₹{billing.storageOverage.toLocaleString()}</span>
-              </div>
-              <div className="billing-cost-row">
-                <span className="cost-label">Bandwidth Overage Cost</span>
-                <span className="cost-value">₹{billing.bandwidthOverage.toLocaleString()}</span>
-              </div>
-              <div className="billing-cost-row">
-                <span className="cost-label">Total Overages</span>
-                <span className="cost-value" style={{ color: 'var(--warning)' }}>
-                  ₹{billing.totalOverage.toLocaleString()}
-                </span>
-              </div>
-            </div>
-          </div>
-
-          <div style={{ marginTop: '2rem' }}>
-            <div className="total-accrued-row">
-              <span className="total-accrued-label">Current Accrued Cost</span>
-              <span className="total-accrued-value">₹{billing.totalFee.toLocaleString()}</span>
-            </div>
-            <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem' }}>
-              <button onClick={handleGenerateInvoice} className="btn btn-primary" style={{ flex: 1 }}>
-                <FileText size={16} /> Bill End Cycle
-              </button>
-              <button onClick={handleRunAlertCheck} className="btn btn-secondary" title="Check usage threshold triggers">
-                <Bell size={16} /> Alert Check
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Grid: Simulator & Active Alerts */}
-      <div className="simulator-panel">
-        {/* Left Card: Usage Event Simulator */}
-        <div className="glass-card">
-          <div className="section-title">
-            <Sliders size={20} color="#F59E0B" />
-            <span>Real-Time Usage Ingestion Simulator</span>
-          </div>
-          <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '1.25rem' }}>
-            Submit simulated API traffic, storage uploads, or network requests for <strong>{tenant.name}</strong> to test Redis hot counters and threshold triggers in real-time.
+          <h1>Live billing control for multi-tenant usage.</h1>
+          <p>
+            Monitor active counters, push usage into Redis, review invoice history, and trigger alert checks from a single operator surface.
           </p>
 
-          <form onSubmit={handleIngest} className="sim-group">
-            <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
-              <div style={{ flex: 1, minWidth: '150px' }}>
-                <label style={{ display: 'block', fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '0.5rem', fontWeight: 600 }}>
-                  METRIC TYPE
-                </label>
-                <select 
-                  value={ingestMetric} 
-                  onChange={(e) => setIngestMetric(e.target.value as any)}
-                  className="select-input"
-                  style={{ width: '100%' }}
-                >
-                  <option value="api_calls">API Calls (Requests)</option>
-                  <option value="storage_gb">Storage Volume (GB)</option>
-                  <option value="bandwidth_gb">Data Transfer (GB)</option>
-                </select>
-              </div>
-
-              <div style={{ width: '150px' }}>
-                <label style={{ display: 'block', fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '0.5rem', fontWeight: 600 }}>
-                  QUANTITY / VALUE
-                </label>
-                <input 
-                  type="number" 
-                  step="any"
-                  value={ingestAmount}
-                  onChange={(e) => setIngestAmount(e.target.value)}
-                  className="number-input"
-                  style={{ width: '100%' }}
-                  placeholder="e.g. 1000"
-                />
-              </div>
-            </div>
-
-            <button 
-              type="submit" 
-              className="btn btn-accent" 
-              disabled={isSubmitting}
-              style={{ alignSelf: 'flex-start' }}
-            >
-              <PlusCircle size={16} /> {isSubmitting ? 'Ingesting...' : 'Inject Raw Usage Event'}
-            </button>
-          </form>
+          <div className="hero-badges">
+            <span className="status-pill"><Shield size={14} /> Tenant isolated</span>
+            <span className="status-pill"><Clock3 size={14} /> Live period scope</span>
+            <span className="status-pill"><TrendingUp size={14} /> Realtime pricing</span>
+          </div>
         </div>
 
-        {/* Right Card: Alert Logs (AWS SNS mock output) */}
-        <div className="glass-card">
-          <div className="section-title">
-            <AlertTriangle size={20} color="#EF4444" />
-            <span>Active Usage Notifications</span>
+        <div className="hero-controls glass-card-inner">
+          <div className="control-stack">
+            <label htmlFor="tenant-select">Workspace tenant</label>
+            <select
+              id="tenant-select"
+              value={selectedTenantId}
+              onChange={(event) => setSelectedTenantId(event.target.value)}
+              className="select-input"
+            >
+              {tenants.map((tenantOption) => (
+                <option key={tenantOption.tenantId} value={tenantOption.tenantId}>
+                  {tenantOption.name} ({tenantOption.planType})
+                </option>
+              ))}
+            </select>
           </div>
 
-          {alerts.length === 0 ? (
-            <div className="empty-state">No limit alerts generated. Tenant usage is within standard thresholds.</div>
-          ) : (
-            <div className="alerts-list">
-              {alerts.map((alert) => (
-                <div 
-                  key={alert._id} 
-                  className={`alert-item ${alert.thresholdType === '80%' ? 'alert-item-80' : ''}`}
-                >
-                  <div style={{ marginTop: '2px' }}>
-                    <AlertTriangle size={16} color={alert.thresholdType === '80%' ? 'var(--warning)' : 'var(--danger)'} />
-                  </div>
-                  <div>
-                    <div className="alert-message">
-                      Limit warning: <strong>{alert.metric === 'api_calls' ? 'API Ingestion' : alert.metric === 'storage_gb' ? 'Storage Volume' : 'Bandwidth'}</strong> consumed over <strong>{alert.thresholdType}</strong> limit.
-                    </div>
-                    <div className="alert-date">
-                      Value: {alert.usageValue} / {alert.limitValue} &bull; {new Date(alert.createdAt).toLocaleString()}
-                    </div>
-                  </div>
-                </div>
-              ))}
+          <div className="control-row">
+            <button onClick={() => refreshDashboard(selectedTenantId)} className="btn btn-secondary" type="button" disabled={isRefreshing}>
+              <RefreshCw size={16} className={isRefreshing ? 'spin-icon' : ''} />
+              {isRefreshing ? 'Refreshing' : 'Refresh'}
+            </button>
+            <button onClick={handleResetSeed} className="btn btn-tertiary" type="button">
+              <Sparkles size={16} /> Seed
+            </button>
+          </div>
+
+          <div className="control-row">
+            <button
+              type="button"
+              className={dashboardMode === 'overview' ? 'btn btn-primary' : 'btn btn-secondary'}
+              onClick={() => setDashboardMode('overview')}
+            >
+              <TrendingUp size={16} /> Overview
+            </button>
+            <button
+              type="button"
+              className={dashboardMode === 'monthly' ? 'btn btn-primary' : 'btn btn-secondary'}
+              onClick={() => setDashboardMode('monthly')}
+            >
+              <Clock3 size={16} /> Monthly report
+            </button>
+          </div>
+        </div>
+      </section>
+
+      {dashboardMode === 'monthly' && (
+        <section className="monthly-summary glass-card">
+          <div className="section-head">
+            <div>
+              <p className="section-kicker"><Clock3 size={14} /> Current billing month</p>
+              <h3>Platform usage and charge summary</h3>
             </div>
-          )}
-        </div>
-      </div>
+            <span className="section-pill">
+              {formatDate(dashboardData.currentPeriod.periodStart)} - {formatDate(dashboardData.currentPeriod.periodEnd)}
+            </span>
+          </div>
 
-      {/* Invoices List */}
-      <div className="glass-card">
-        <div className="section-title">
-          <FileText size={20} color="#3F83F8" />
-          <span>Billing Statements & Generated Invoices</span>
-        </div>
+          <div className="meta-grid monthly-metrics-grid">
+            <div className="glass-card meta-card">
+              <p className="meta-label">Total usage events</p>
+              <h2>{monthlyTotalEvents.toLocaleString()}</h2>
+              <p className="meta-copy">Number of usage submissions recorded this month.</p>
+            </div>
+            <div className="glass-card meta-card">
+              <p className="meta-label">Estimated monthly add-on</p>
+              <h2>{formatCurrency(monthlyTotalCharge)}</h2>
+              <p className="meta-copy">Overage charge derived from the current billing period.</p>
+            </div>
+            <div className="glass-card meta-card">
+              <p className="meta-label">Billing period</p>
+              <h2>{dashboardData.currentPeriod.periodKey}</h2>
+              <p className="meta-copy">Aligned to the tenant billing anchor day.</p>
+            </div>
+          </div>
 
-        {invoices.length === 0 ? (
-          <div className="empty-state">No billing statements available yet for this workspace.</div>
-        ) : (
-          <div className="table-wrapper">
+          <div className="monthly-table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>Invoice ID</th>
-                  <th>Statement Period</th>
-                  <th>Base Price</th>
-                  <th>Overage Fee</th>
-                  <th>Total Cost</th>
-                  <th>Status</th>
-                  <th>Actions</th>
+                  <th>Platform</th>
+                  <th>Usage events</th>
+                  <th>Monthly usage</th>
+                  <th>Estimated charge</th>
                 </tr>
               </thead>
               <tbody>
-                {invoices.map((inv) => (
-                  <tr key={inv._id}>
-                    <td style={{ fontWeight: 600 }}>{inv.invoiceNumber}</td>
+                {dashboardData.monthlyBreakdown.map((item) => (
+                  <tr key={item.metric}>
                     <td>
-                      {new Date(inv.periodStart).toLocaleDateString()} - {new Date(inv.periodEnd).toLocaleDateString()}
+                      <strong>{metricCopy[item.metric].label}</strong>
                     </td>
-                    <td>₹{inv.baseFee.toLocaleString()}</td>
-                    <td style={{ color: inv.overageFee > 0 ? 'var(--warning)' : 'var(--text-primary)' }}>
-                      ₹{inv.overageFee.toLocaleString()}
-                    </td>
-                    <td style={{ fontWeight: 700 }}>₹{inv.totalFee.toLocaleString()}</td>
+                    <td>{item.eventCount.toLocaleString()}</td>
                     <td>
-                      <span className={`badge ${inv.status === 'Paid' ? 'badge-paid' : 'badge-pending'}`}>
-                        {inv.status}
-                      </span>
+                      {item.metric === 'api_calls'
+                        ? item.totalUsage.toLocaleString()
+                        : `${item.totalUsage.toFixed(2)} GB`}
                     </td>
-                    <td>
-                      <a 
-                        href={`http://localhost:4000${inv.pdfPath}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="btn btn-secondary"
-                        style={{ padding: '0.35rem 0.75rem', fontSize: '0.75rem' }}
-                      >
-                        <FileText size={12} /> PDF Invoice
-                      </a>
-                    </td>
+                    <td><strong>{formatCurrency(item.charge)}</strong></td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
-        )}
-      </div>
-    </div>
+        </section>
+      )}
+
+      <section className="meta-grid">
+        <div className="glass-card meta-card">
+          <div className="meta-top">
+            <div>
+              <p className="meta-label">Tenant</p>
+              <h2>{tenant.name}</h2>
+            </div>
+            <div className={`mini-mark tone-${getBand(apiPercent)}`}>
+              {tenant.planType}
+            </div>
+          </div>
+          <p className="meta-copy">{tenant.email}</p>
+          <div className="meta-footer">
+            <span><User size={14} /> ID {tenant.tenantId}</span>
+            <span><Bell size={14} /> {alertCount} active alert{alertCount === 1 ? '' : 's'}</span>
+          </div>
+        </div>
+
+        <div className="glass-card meta-card">
+          <p className="meta-label">Current accrued cost</p>
+          <div className="price-row">
+            <h2>{formatCurrency(billing.totalFee)}</h2>
+            <ArrowUpRight size={18} />
+          </div>
+          <p className="meta-copy">Base fee {formatCurrency(billing.baseFee)} + overages {formatCurrency(billing.totalOverage)}</p>
+        </div>
+
+        <div className="glass-card meta-card">
+          <p className="meta-label">Billing anchor</p>
+          <h2>{tenant.billingAnchorDay ?? 'Default'}</h2>
+          <p className="meta-copy">Period resets are aligned to the tenant anchor day.</p>
+        </div>
+      </section>
+
+      <section className="usage-grid">
+        {utilizationCards.map((card) => {
+          const toneClass = `tone-${getBand(card.percent)}`;
+          const metric = metricCopy[card.key];
+
+          return (
+            <article key={card.key} className={`glass-card metric-card ${toneClass}`}>
+              <div className="metric-head">
+                <div className="metric-head-left">
+                  <div className={`metric-icon metric-icon-${card.key}`}>{metric.icon}</div>
+                  <div>
+                    <p className="metric-label">{card.label}</p>
+                    <span className="metric-subtext">Limit {card.limit}</span>
+                  </div>
+                </div>
+                <span className={`usage-chip chip-${getBand(card.percent)}`}>{card.percent}%</span>
+              </div>
+
+              <div className="metric-value">{card.value}</div>
+              <div className="progress-track" aria-hidden="true">
+                <div className={`progress-fill fill-${getBand(card.percent)}`} style={{ width: `${card.percent}%` }} />
+              </div>
+            </article>
+          );
+        })}
+      </section>
+
+      <section className="dashboard-grid">
+        <article className="glass-card chart-card">
+          <div className="section-head">
+            <div>
+              <p className="section-kicker"><Activity size={14} /> 14-day usage history</p>
+              <h3>Live counter trend</h3>
+            </div>
+            <span className="section-pill">Redis-backed live view</span>
+          </div>
+
+          {history.length === 0 ? (
+            <div className="empty-state">No historical usage yet. Ingest usage to build the trend line.</div>
+          ) : (
+            <div className="chart-wrap">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={history} margin={{ top: 8, right: 0, left: -12, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="historyApi" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="8%" stopColor="#7c8cff" stopOpacity={0.38} />
+                      <stop offset="92%" stopColor="#7c8cff" stopOpacity={0} />
+                    </linearGradient>
+                    <linearGradient id="historyStorage" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="8%" stopColor="#2fd4a8" stopOpacity={0.34} />
+                      <stop offset="92%" stopColor="#2fd4a8" stopOpacity={0} />
+                    </linearGradient>
+                    <linearGradient id="historyBandwidth" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="8%" stopColor="#f5a524" stopOpacity={0.34} />
+                      <stop offset="92%" stopColor="#f5a524" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+                  <XAxis dataKey="name" stroke="rgba(226,232,240,0.45)" tickLine={false} axisLine={false} />
+                  <YAxis stroke="rgba(226,232,240,0.45)" tickLine={false} axisLine={false} />
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: '#09111f',
+                      border: '1px solid rgba(255,255,255,0.08)',
+                      borderRadius: '16px',
+                      color: '#f8fafc',
+                      boxShadow: '0 24px 60px rgba(0,0,0,0.35)',
+                    }}
+                    labelStyle={{ color: '#e2e8f0' }}
+                  />
+                  <Legend />
+                  <Area type="monotone" name="API calls" dataKey="api_calls" stroke="#7c8cff" fill="url(#historyApi)" strokeWidth={2} />
+                  <Area type="monotone" name="Storage GB" dataKey="storage_gb" stroke="#2fd4a8" fill="url(#historyStorage)" strokeWidth={2} />
+                  <Area type="monotone" name="Bandwidth GB" dataKey="bandwidth_gb" stroke="#f5a524" fill="url(#historyBandwidth)" strokeWidth={2} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </article>
+
+        <article className="glass-card billing-card">
+          <div className="section-head">
+            <div>
+              <p className="section-kicker"><DollarSign size={14} /> Pricing engine</p>
+              <h3>Current billing breakdown</h3>
+            </div>
+            <span className="section-pill">Plan {tenant.planType}</span>
+          </div>
+
+          <div className="billing-lines">
+            <div className="billing-line">
+              <span>Base fee</span>
+              <strong>{formatCurrency(billing.baseFee)}</strong>
+            </div>
+            <div className="billing-line">
+              <span>API overage</span>
+              <strong>{formatCurrency(billing.apiOverage)}</strong>
+            </div>
+            <div className="billing-line">
+              <span>Storage overage</span>
+              <strong>{formatCurrency(billing.storageOverage)}</strong>
+            </div>
+            <div className="billing-line">
+              <span>Bandwidth overage</span>
+              <strong>{formatCurrency(billing.bandwidthOverage)}</strong>
+            </div>
+            <div className="billing-line billing-line-total">
+              <span>Total overages</span>
+              <strong>{formatCurrency(billing.totalOverage)}</strong>
+            </div>
+          </div>
+
+          <div className="billing-total">
+            <div>
+              <p className="meta-label">Current accrued cost</p>
+              <h2>{formatCurrency(billing.totalFee)}</h2>
+            </div>
+            <div className="billing-actions">
+              <button onClick={handleGenerateInvoice} className="btn btn-primary" type="button">
+                <FileText size={16} /> Generate invoice
+              </button>
+              <button onClick={handleRunAlertCheck} className="btn btn-secondary" type="button">
+                <Bell size={16} /> Run alerts
+              </button>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section className="dashboard-grid dashboard-grid-secondary">
+        <article className="glass-card">
+          <div className="section-head">
+            <div>
+              <p className="section-kicker"><Sliders size={14} /> Usage intake</p>
+              <h3>Simulate live tenant activity</h3>
+            </div>
+            <span className="section-pill">POST /api/usage</span>
+          </div>
+
+          <form onSubmit={handleIngest} className="sim-form">
+            <div className="field-grid">
+              <label className="field-block">
+                <span>Metric type</span>
+                <select value={ingestMetric} onChange={(event) => setIngestMetric(event.target.value as MetricName)} className="select-input">
+                  {metricOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="field-block">
+                <span>Quantity</span>
+                <input
+                  type="number"
+                  step="any"
+                  value={ingestAmount}
+                  onChange={(event) => setIngestAmount(event.target.value)}
+                  className="number-input"
+                  placeholder="1000"
+                />
+              </label>
+            </div>
+
+            <button type="submit" className="btn btn-accent" disabled={isSubmitting}>
+              <PlusCircle size={16} /> {isSubmitting ? 'Recording usage' : 'Inject usage event'}
+            </button>
+          </form>
+        </article>
+
+        <article className="glass-card">
+          <div className="section-head">
+            <div>
+              <p className="section-kicker"><AlertTriangle size={14} /> Alert feed</p>
+              <h3>Threshold visibility</h3>
+            </div>
+            <span className="section-pill">Recent {alerts.length}</span>
+          </div>
+
+          {alerts.length === 0 ? (
+            <div className="empty-state">No alerts have fired for this tenant yet.</div>
+          ) : (
+            <div className="alerts-list">
+              {alerts.map((alert) => (
+                <div key={alert._id} className={`alert-item alert-${getBand(getUsagePercentage(alert.usageValue, alert.limitValue))}`}>
+                  <div className="alert-icon">
+                    <AlertTriangle size={16} />
+                  </div>
+                  <div className="alert-copy">
+                    <strong>{metricCopy[alert.metric].label}</strong> crossed {alert.thresholdType} of the configured limit.
+                    <span>{alert.usageValue} / {alert.limitValue}</span>
+                    <span>{formatDateTime(alert.createdAt)}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </article>
+      </section>
+
+      <section className="dashboard-grid dashboard-grid-secondary">
+        <article className="glass-card">
+          <div className="section-head">
+            <div>
+              <p className="section-kicker"><FileText size={14} /> Invoice ledger</p>
+              <h3>Generated statements</h3>
+            </div>
+            <span className="section-pill">MongoDB history</span>
+          </div>
+
+          {invoices.length === 0 ? (
+            <div className="empty-state">No invoices have been generated for this tenant yet.</div>
+          ) : (
+            <div className="table-wrapper">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Invoice</th>
+                    <th>Period</th>
+                    <th>Base</th>
+                    <th>Overage</th>
+                    <th>Total</th>
+                    <th>Status</th>
+                    <th>PDF</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {invoices.map((invoice) => (
+                    <tr key={invoice._id}>
+                      <td>
+                        <strong>{invoice.invoiceNumber}</strong>
+                        <div className="table-subtext">Email {invoice.emailSent ? 'sent' : 'pending'}</div>
+                      </td>
+                      <td>
+                        {formatDate(invoice.periodStart)} - {formatDate(invoice.periodEnd)}
+                      </td>
+                      <td>{formatCurrency(invoice.baseFee)}</td>
+                      <td>{formatCurrency(invoice.overageFee)}</td>
+                      <td><strong>{formatCurrency(invoice.totalFee)}</strong></td>
+                      <td>
+                        <span className={`table-badge table-badge-${invoice.status.toLowerCase()}`}>{invoice.status}</span>
+                      </td>
+                      <td>
+                        <a href={`${BACKEND_URL}${invoice.pdfPath}`} target="_blank" rel="noreferrer" className="btn btn-ghost">
+                          <FileText size={14} /> Open PDF
+                        </a>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </article>
+
+        <article className="glass-card">
+          <div className="section-head">
+            <div>
+              <p className="section-kicker"><TrendingUp size={14} /> Breakdown</p>
+              <h3>Live usage by resource</h3>
+            </div>
+            <span className="section-pill">Period scoped</span>
+          </div>
+
+          <div className="bar-chart-wrap">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={utilizationCards} margin={{ top: 8, right: 0, left: -12, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+                <XAxis dataKey="label" stroke="rgba(226,232,240,0.45)" tickLine={false} axisLine={false} />
+                <YAxis stroke="rgba(226,232,240,0.45)" tickLine={false} axisLine={false} />
+                <Tooltip
+                  contentStyle={{
+                    backgroundColor: '#09111f',
+                    border: '1px solid rgba(255,255,255,0.08)',
+                    borderRadius: '16px',
+                    color: '#f8fafc',
+                  }}
+                />
+                <Bar dataKey="percent" radius={[10, 10, 0, 0]} fill="#7c8cff" name="Utilization %" />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="resource-summary">
+            {utilizationCards.map((card) => (
+              <div key={card.key} className="resource-item">
+                <div className="resource-top">
+                  <span>{card.label}</span>
+                  <strong>{card.percent}%</strong>
+                </div>
+                <div className="progress-track">
+                  <div className={`progress-fill fill-${getBand(card.percent)}`} style={{ width: `${card.percent}%` }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </article>
+      </section>
+    </main>
   );
 }

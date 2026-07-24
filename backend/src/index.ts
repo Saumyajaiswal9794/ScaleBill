@@ -2,19 +2,51 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import cookieParser from 'cookie-parser';
 import PDFDocument from 'pdfkit';
 import { connectDB, redis } from './db';
-import { Tenant, UsageEvent, Invoice, Alert } from './models';
+import { Tenant, UsageEvent, Invoice, Alert, User } from './models';
 import { calculateBilling, PLAN_PRICING } from './pricing';
 import { processTenantInvoice } from './workers/invoiceWorker';
 import { checkTenantUsageAlerts } from './workers/alertWorker';
 import { getBillingPeriod, getRedisUsageKey, getTenantBillingAnchorDay } from './billingPeriod';
+import {
+  requireAuth,
+  requireRole,
+  requireTenantAccess,
+  requireAuthOrApiKey,
+  generateAccessToken,
+  generateRefreshToken,
+  hashToken,
+  AuthenticatedRequest
+} from './middleware/auth';
+import {
+  generalApiLimiter,
+  loginLimiter,
+  usageIngestionLimiter,
+  shouldSkipGeneralRateLimit
+} from './middleware/rateLimiter';
+import {
+  validateBody,
+  validateTenantIdParam,
+  usageIngestSchema,
+  tenantCreateSchema,
+  loginSchema,
+  registerSchema,
+  tenantIdBodySchema
+} from './middleware/validation';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-app.use(cors());
+app.use(cors({
+  origin: 'http://localhost:3000',
+  credentials: true
+}));
 app.use(express.json());
+app.use(cookieParser());
 
 // Serve static invoice PDFs
 const INVOICES_DIR = path.join(__dirname, '../../../invoices');
@@ -23,10 +55,170 @@ if (!fs.existsSync(INVOICES_DIR)) {
 }
 app.use('/invoices', express.static(INVOICES_DIR));
 
-// 1. Get all tenants
-app.get('/api/tenants', async (req, res) => {
+app.use((req, res, next) => {
+  if (shouldSkipGeneralRateLimit(req.path)) {
+    return next();
+  }
+  return generalApiLimiter(req as AuthenticatedRequest, res, next);
+});
+
+// Authentication endpoints
+app.post('/api/auth/register', validateBody(registerSchema), async (req, res) => {
   try {
-    const tenants = await Tenant.find().sort({ name: 1 });
+    const { email, password, role, tenantIds } = req.body;
+    const existing = await User.findOne({ email: email.toLowerCase() });
+    if (existing) {
+      return res.status(400).json({ error: 'Email already registered' });
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
+    const user = new User({
+      email: email.toLowerCase(),
+      passwordHash,
+      role,
+      tenantIds: tenantIds || []
+    });
+    await user.save();
+    res.status(201).json({ message: 'User registered successfully', userId: user._id });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Registration failed' });
+  }
+});
+
+app.post('/api/auth/login', loginLimiter, validateBody(loginSchema), async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await User.findOne({ email: email.toLowerCase() });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    const isMatch = await bcrypt.compare(password, user.passwordHash);
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const accessToken = generateAccessToken(user);
+    const refreshToken = generateRefreshToken(user);
+
+    const hashed = hashToken(refreshToken);
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7);
+
+    user.refreshTokens.push({ tokenHash: hashed, expiresAt });
+    user.refreshTokens = user.refreshTokens.filter(rt => rt.expiresAt > new Date());
+    await user.save();
+
+    res.cookie('refreshToken', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+    });
+
+    res.json({
+      accessToken,
+      user: {
+        id: user._id,
+        email: user.email,
+        role: user.role,
+        tenantIds: user.tenantIds
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Login failed' });
+  }
+});
+
+app.post('/api/auth/refresh', async (req, res) => {
+  try {
+    const refreshToken = req.cookies.refreshToken;
+    if (!refreshToken) {
+      return res.status(401).json({ error: 'Refresh token required' });
+    }
+
+    let decoded: any;
+    try {
+      const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'default_jwt_refresh_secret_8888_key';
+      decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
+    } catch (e) {
+      return res.status(401).json({ error: 'Invalid or expired refresh token' });
+    }
+
+    const user = await User.findById(decoded.id);
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+
+    const hashed = hashToken(refreshToken);
+    const tokenIndex = user.refreshTokens.findIndex(rt => rt.tokenHash === hashed && rt.expiresAt > new Date());
+    if (tokenIndex === -1) {
+      return res.status(401).json({ error: 'Invalid, revoked, or expired refresh token' });
+    }
+
+    const newAccessToken = generateAccessToken(user);
+    const newRefreshToken = generateRefreshToken(user);
+    const newHashed = hashToken(newRefreshToken);
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7);
+
+    user.refreshTokens[tokenIndex] = { tokenHash: newHashed, expiresAt };
+    user.refreshTokens = user.refreshTokens.filter(rt => rt.expiresAt > new Date());
+    await user.save();
+
+    res.cookie('refreshToken', newRefreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
+
+    res.json({
+      accessToken: newAccessToken,
+      user: {
+        id: user._id,
+        email: user.email,
+        role: user.role,
+        tenantIds: user.tenantIds
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Token refresh failed' });
+  }
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  try {
+    const refreshToken = req.cookies.refreshToken;
+    if (refreshToken) {
+      const hashed = hashToken(refreshToken);
+      try {
+        const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'default_jwt_refresh_secret_8888_key';
+        const decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET) as any;
+        const user = await User.findById(decoded.id);
+        if (user) {
+          user.refreshTokens = user.refreshTokens.filter(rt => rt.tokenHash !== hashed);
+          await user.save();
+        }
+      } catch (e) {
+        // Suppress error
+      }
+    }
+    res.clearCookie('refreshToken', {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax'
+    });
+    res.json({ success: true, message: 'Logged out successfully' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Logout failed' });
+  }
+});
+
+// 1. Get all tenants
+app.get('/api/tenants', requireAuth, requireRole(['owner', 'admin']), async (req: AuthenticatedRequest, res) => {
+  try {
+    // Owners see all tenants; admins see only tenants they have access to
+    const query = req.user?.role === 'owner' ? {} : { tenantId: { $in: req.user?.tenantIds || [] } };
+    const tenants = await Tenant.find(query).sort({ name: 1 });
     res.json(tenants);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch tenants' });
@@ -34,14 +226,12 @@ app.get('/api/tenants', async (req, res) => {
 });
 
 // 2. Create tenant
-app.post('/api/tenants', async (req, res) => {
+app.post('/api/tenants', requireAuth, requireRole(['owner']), validateBody(tenantCreateSchema), async (req: AuthenticatedRequest, res) => {
   try {
     const { tenantId, name, planType, email } = req.body;
     const pricing = PLAN_PRICING[planType as 'Starter' | 'Pro' | 'Enterprise'];
 
-    if (!pricing) {
-      return res.status(400).json({ error: 'Invalid plan type' });
-    }
+    const apiKey = `key_${tenantId}_${Math.random().toString(36).substring(2, 10)}`;
 
     const tenant = new Tenant({
       tenantId,
@@ -51,7 +241,8 @@ app.post('/api/tenants', async (req, res) => {
       apiLimit: pricing.apiLimit,
       storageLimit: pricing.storageLimit,
       bandwidthLimit: pricing.bandwidthLimit,
-      billingAnchorDay: new Date().getDate()
+      billingAnchorDay: new Date().getDate(),
+      apiKey
     });
 
     await tenant.save();
@@ -70,12 +261,20 @@ app.post('/api/tenants', async (req, res) => {
 });
 
 // 3. Ingest usage event
-app.post('/api/usage', async (req, res) => {
+app.post('/api/usage', validateBody(usageIngestSchema), requireAuthOrApiKey, usageIngestionLimiter, async (req: AuthenticatedRequest, res) => {
   try {
-    const { tenantId, metric, amount, idempotencyKey } = req.body;
+    let tenantId = req.body.tenantId;
+    if (req.tenant) {
+      if (tenantId && tenantId !== req.tenant.tenantId) {
+        return res.status(403).json({ error: 'Forbidden: API key does not match the requested tenantId' });
+      }
+      tenantId = req.tenant.tenantId;
+    }
 
-    if (!tenantId || !metric || amount === undefined) {
-      return res.status(400).json({ error: 'Missing required parameters' });
+    const { metric, amount, idempotencyKey } = req.body;
+
+    if (!tenantId) {
+      return res.status(400).json({ error: 'Missing required parameters', details: [{ field: 'tenantId', message: 'tenantId is required' }] });
     }
 
     const tenant = await Tenant.findOne({ tenantId });
@@ -132,7 +331,7 @@ app.post('/api/usage', async (req, res) => {
 });
 
 // 4. Get tenant dashboard details
-app.get('/api/dashboard/:tenantId', async (req, res) => {
+app.get('/api/dashboard/:tenantId', requireAuth, validateTenantIdParam, requireTenantAccess, async (req: AuthenticatedRequest, res) => {
   try {
     const { tenantId } = req.params;
     const tenant = await Tenant.findOne({ tenantId });
@@ -266,7 +465,7 @@ app.get('/api/dashboard/:tenantId', async (req, res) => {
 });
 
 // 5. Trigger manual invoice generation
-app.post('/api/invoices/generate', async (req, res) => {
+app.post('/api/invoices/generate', requireAuth, requireRole(['owner', 'admin']), validateBody(tenantIdBodySchema), requireTenantAccess, async (req: AuthenticatedRequest, res) => {
   try {
     const { tenantId } = req.body;
     const tenant = await Tenant.findOne({ tenantId });
@@ -286,7 +485,7 @@ app.post('/api/invoices/generate', async (req, res) => {
 });
 
 // 6. Manual Alert Check
-app.post('/api/alerts/check', async (req, res) => {
+app.post('/api/alerts/check', requireAuth, requireRole(['owner', 'admin']), validateBody(tenantIdBodySchema), requireTenantAccess, async (req: AuthenticatedRequest, res) => {
   try {
     const { tenantId } = req.body;
     const tenant = await Tenant.findOne({ tenantId });
@@ -304,13 +503,18 @@ app.post('/api/alerts/check', async (req, res) => {
 // 7. Seed Database endpoint
 app.post('/api/seed', async (req, res) => {
   try {
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(403).json({ error: 'Seeding is disabled in non-development environments' });
+    }
+
     // Clear old records
     await Tenant.deleteMany({});
     await UsageEvent.deleteMany({});
     await Invoice.deleteMany({});
     await Alert.deleteMany({});
+    await User.deleteMany({});
 
-    // Create default tenants
+    // Create default tenants with hardcoded API keys for predictable local testing
     const sampleTenants = [
       {
         tenantId: 'acme',
@@ -320,7 +524,8 @@ app.post('/api/seed', async (req, res) => {
         apiLimit: PLAN_PRICING.Starter.apiLimit,
         storageLimit: PLAN_PRICING.Starter.storageLimit,
         bandwidthLimit: PLAN_PRICING.Starter.bandwidthLimit,
-        billingAnchorDay: 1
+        billingAnchorDay: 1,
+        apiKey: 'key_acme_123'
       },
       {
         tenantId: 'betalabs',
@@ -330,7 +535,8 @@ app.post('/api/seed', async (req, res) => {
         apiLimit: PLAN_PRICING.Pro.apiLimit,
         storageLimit: PLAN_PRICING.Pro.storageLimit,
         bandwidthLimit: PLAN_PRICING.Pro.bandwidthLimit,
-        billingAnchorDay: 1
+        billingAnchorDay: 1,
+        apiKey: 'key_betalabs_123'
       },
       {
         tenantId: 'sigma',
@@ -340,11 +546,36 @@ app.post('/api/seed', async (req, res) => {
         apiLimit: PLAN_PRICING.Enterprise.apiLimit,
         storageLimit: PLAN_PRICING.Enterprise.storageLimit,
         bandwidthLimit: PLAN_PRICING.Enterprise.bandwidthLimit,
-        billingAnchorDay: 1
+        billingAnchorDay: 1,
+        apiKey: 'key_sigma_123'
       }
     ];
 
     const tenants = await Tenant.insertMany(sampleTenants);
+
+    // Create default users (password: 'password123')
+    const defaultPasswordHash = await bcrypt.hash('password123', 10);
+    const sampleUsers = [
+      {
+        email: 'owner@scalebill.com',
+        passwordHash: defaultPasswordHash,
+        role: 'owner',
+        tenantIds: ['acme', 'betalabs', 'sigma']
+      },
+      {
+        email: 'admin@acme.com',
+        passwordHash: defaultPasswordHash,
+        role: 'admin',
+        tenantIds: ['acme']
+      },
+      {
+        email: 'viewer@acme.com',
+        passwordHash: defaultPasswordHash,
+        role: 'viewer',
+        tenantIds: ['acme']
+      }
+    ];
+    await User.insertMany(sampleUsers);
 
     // Seed mock data for each tenant
     for (const t of tenants) {

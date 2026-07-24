@@ -10,6 +10,7 @@ export interface ITenant extends Document {
   storageLimit: number; // in GB
   bandwidthLimit: number; // in GB
   billingAnchorDay: number;
+  apiKey?: string;
   createdAt: Date;
 }
 
@@ -22,6 +23,7 @@ const TenantSchema: Schema = new Schema({
   storageLimit: { type: Number, required: true },
   bandwidthLimit: { type: Number, required: true },
   billingAnchorDay: { type: Number, required: true, default: 1 },
+  apiKey: { type: String, required: false, sparse: true, index: true },
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -131,4 +133,30 @@ export const UsageEvent = mongoose.model<IUsageEvent>('UsageEvent', UsageEventSc
 export const Invoice = mongoose.model<IInvoice>('Invoice', InvoiceSchema);
 export const Alert = mongoose.model<IAlert>('Alert', AlertSchema);
 export const InvoiceCounter = mongoose.model<IInvoiceCounter>('InvoiceCounter', InvoiceCounterSchema);
+
+export interface IUser extends Document {
+  email: string;
+  passwordHash: string;
+  role: 'owner' | 'admin' | 'viewer';
+  tenantIds: string[];
+  refreshTokens: {
+    tokenHash: string;
+    expiresAt: Date;
+  }[];
+  createdAt: Date;
+}
+
+const UserSchema: Schema = new Schema({
+  email: { type: String, required: true, unique: true, lowercase: true, index: true },
+  passwordHash: { type: String, required: true },
+  role: { type: String, enum: ['owner', 'admin', 'viewer'], required: true },
+  tenantIds: { type: [String], default: [] },
+  refreshTokens: [{
+    tokenHash: { type: String, required: true },
+    expiresAt: { type: Date, required: true }
+  }],
+  createdAt: { type: Date, default: Date.now }
+});
+
+export const User = mongoose.model<IUser>('User', UserSchema);
 
